@@ -69,7 +69,7 @@ except Exception:
 try:
     FORWARD_BATCH_SIZE = config.getint("forwarding", "forward_batch_size")
 except Exception:
-    FORWARD_BATCH_SIZE = 1
+    FORWARD_BATCH_SIZE = 100
 
 # Anzahl paralleler Worker / Semaphore-Size.
 # Bei sehr großen Dateien setze 1 (empfohlen). Höher nur, wenn du Netz/Ratenlimits testen kannst.
@@ -91,6 +91,8 @@ try:
 except Exception:
     MAX_BATCH_BYTES = 0  # 0 = no limit (default)
 
+PERSIST_FORWARDED_UIDS_FILE = config.get("forwarding", "PERSIST_FORWARDED_UIDS_FILE")   
+
 # -------------------
 # Sonstiges / Sicherheit
 # -------------------
@@ -107,6 +109,7 @@ try:
     DEBUG_PAUSE = config.getboolean("general", "debug_pause")
 except Exception:
     DEBUG_PAUSE = False
+
 
 # -------------------
 # End of config
