@@ -1,7 +1,7 @@
 # debug_forward_one.py
 import asyncio
 from telethon import TelegramClient
-from config import api_id, api_hash, session, SOURCE_GROUPS, TARGET_GROUP
+from tgd_config import api_id, api_hash, session, SOURCE_GROUPS, TARGET_GROUP
 
 MID = 7  # replace with a real id from dump
 SRC = SOURCE_GROUPS[0]

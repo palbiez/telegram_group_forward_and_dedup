@@ -19,7 +19,7 @@ from typing import Optional, Set
 from telethon import TelegramClient
 from telethon.tl.types import Message
 
-from config import (
+from tgd_config import (
     api_id,
     api_hash,
     session,

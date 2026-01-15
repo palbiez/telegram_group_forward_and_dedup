@@ -11,7 +11,7 @@ from telethon.tl.functions.channels import GetForumTopicsRequest
 from telethon.tl.functions.messages import GetHistoryRequest
 from telethon.tl.types import Message
 
-from config import (
+from tgd_config import (
     api_id, api_hash, session,
     TARGET_GROUP,
     DRY_RUN,

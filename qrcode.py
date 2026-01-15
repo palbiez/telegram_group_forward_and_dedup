@@ -1,7 +1,7 @@
 import asyncio
 from telethon import TelegramClient
 import qrcode
-from config import (
+from tgd_config import (
     api_id,
     api_hash,
     session
