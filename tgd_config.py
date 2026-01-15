@@ -25,6 +25,9 @@ SOURCE_GROUPS = [
     for line in cfg.get("groups", "source_groups").splitlines()
     if line.strip()
 ]
+# numeric UI topic id (what you previously called "topic.id"), e.g. 239
+TARGET_TOPIC = 239
+
 
 
 # ---------------- Forwarding ----------------
@@ -53,3 +56,4 @@ STATE_FILE = cfg.get("forwarding", "state_file", fallback="state.json")
 # ---------------- Logging ----------------
 LOG_DIR = cfg.get("logging", "log_dir", fallback="logs")
 LOG_LEVEL = cfg.get("logging", "log_level", fallback="INFO")
+

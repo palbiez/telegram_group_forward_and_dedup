@@ -1,216 +1,525 @@
-# tgd_reply_latest.py
+#!/usr/bin/env python3
+# coding: utf-8
 """
-Reply the newest message from source topic 3350 as a forward/reply to the placeholder message
-created earlier in tgd_post_placeholder.py.
+tgd_reply_latest.py — Telethon 1.42-ready (full file)
 
-Behavior:
-- Loads placeholder info from tgd_placeholder.json to know which message to reply to.
-- Resolves source group (link in tgd_config.SOURCE_GROUPS -- first entry or specific one).
-- Tries channels.GetForumTopicsByIDRequest to fetch topic metadata (may include 'top_message').
-- If that returns a concrete top_message id, fetch that message and forward it as a reply.
-- Otherwise fallback: iter_messages over the source channel (newest first) and filter by
-  attributes commonly used to signal topic membership (forum_topic, reply_to_top_id, thread_id).
-- Forward the found message to the target channel, replying to the placeholder message id.
-- Logging to LOG_DIR / tgd_reply_latest.log
+Reads tgd_placeholder.json and forwards the latest message from a source topic
+into the target, attempting to place it into the same forum topic using the
+topic anchor (top_message) when available.
+
+Requirements:
+ - tgd_config.py present with: session, api_id, api_hash, SOURCE_GROUPS (list)
+ - tgd_placeholder.json created by tgd_placeholder.py
 """
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime
-from telethon import TelegramClient, functions, utils
-from telethon.tl import functions as tl_functions
+from typing import Optional
 
-# import user config
+from telethon import TelegramClient, functions, types, helpers
+
+# --- Paths & config ---
+PLACEHOLDER_META = Path("tgd_placeholder.json")
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "tgd_reply_latest.log"
+
 try:
     import tgd_config as cfg
 except Exception as e:
-    raise SystemExit("Could not import tgd_config.py: " + repr(e))
+    raise SystemExit("Missing or invalid tgd_config.py: " + repr(e))
 
-LOG_DIR = Path(cfg.LOG_DIR if hasattr(cfg, "LOG_DIR") else "logs")
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-log_file = LOG_DIR / "tgd_reply_latest.log"
+SESSION = getattr(cfg, "session", "user_session")
+API_ID = getattr(cfg, "api_id", None)
+API_HASH = getattr(cfg, "api_hash", None)
+SOURCE_GROUPS = getattr(cfg, "SOURCE_GROUPS", [])
+SEARCH_ITER_LIMIT = int(getattr(cfg, "SEARCH_ITER_LIMIT", 2000))
+LOG_LEVEL = getattr(cfg, "LOG_LEVEL", "INFO")
 
+# Logging
 logging.basicConfig(
-    level=getattr(logging, getattr(cfg, "LOG_LEVEL", "INFO")),
+    level=getattr(logging, LOG_LEVEL),
     format="%(asctime)s | %(levelname)s | tgd_reply_latest | %(message)s",
     handlers=[
-        logging.FileHandler(log_file, encoding="utf-8"),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
         logging.StreamHandler()
-    ],
+    ]
 )
-
 logger = logging.getLogger("tgd_reply_latest")
 
-PLACEHOLDER_JSON = Path("tgd_placeholder.json")
-SOURCE_LINK = None
-SOURCE_TOPIC_ID = 3350
-SEARCH_ITER_LIMIT = 5000  # safety limit for message scanning
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
 
-async def main():
-    logger.info("Starting tgd_reply_latest")
+async def resolve_entity(client: TelegramClient, peer_identifier):
+    ent = await client.get_entity(peer_identifier)
+    inp = await client.get_input_entity(ent)
+    return ent, inp
 
-    # Check placeholder meta
-    if not PLACEHOLDER_JSON.exists():
-        logger.error("Placeholder metadata %s not found. Run tgd_post_placeholder first.", PLACEHOLDER_JSON)
-        return
-    meta = json.loads(PLACEHOLDER_JSON.read_text())
 
-    target_peer = meta.get("target_peer") or meta.get("target_channel_id")
-    placeholder_msg_id = meta.get("target_message_id")
-    if not (target_peer and placeholder_msg_id):
-        logger.error("Placeholder metadata incomplete: %s", meta)
-        return
-
-    # Determine source link: use first SOURCE_GROUP from config if available OR explicit string
-    if getattr(cfg, "SOURCE_GROUPS", None):
-        if isinstance(cfg.SOURCE_GROUPS, (list, tuple)) and len(cfg.SOURCE_GROUPS) > 0:
-            SOURCE_LINK = cfg.SOURCE_GROUPS[0]
-    if not SOURCE_LINK:
-        logger.error("No SOURCE_GROUP configured in tgd_config.SOURCE_GROUPS. Aborting.")
-        return
-
-    client = TelegramClient(cfg.session, cfg.api_id, cfg.api_hash)
-    await client.start()
-    logger.info("Client started")
-
-    # resolve entities
+async def find_candidate_message(
+    client: TelegramClient,
+    source_entity,
+    source_input,
+    source_topic_id: int,
+    search_limit: int = SEARCH_ITER_LIMIT
+) -> Optional[types.Message]:
+    """
+    Find a candidate (top_message / representative message) for a given source topic id.
+    Order:
+      1) messages.GetForumTopicsByIDRequest(peer, topics=[topic_id])
+      2) messages.GetForumTopicsRequest(...) list & match
+      3) channels.GetForumTopicsRequest(...) fallback (Telethon 1.41)
+      4) iter_messages scanning with many heuristics
+    Returns a telethon.types.Message or None.
+    """
+    # 1) Try direct by-ID
     try:
-        source_entity = await client.get_entity(SOURCE_LINK)
-        target_entity = await client.get_entity(target_peer)
-        source_input = await client.get_input_entity(source_entity)
-        target_input = await client.get_input_entity(target_entity)
-        logger.info("Resolved source entity: %s", repr(source_entity))
-        logger.info("Resolved target entity: %s", repr(target_entity))
-    except Exception as e:
-        logger.exception("Could not resolve entities: %s", e)
-        await client.disconnect()
-        return
-
-    # 1) Try to fetch topic metadata via channels.GetForumTopicsByIDRequest
-    candidate_msg = None
-    try:
-        logger.info("Trying channels.GetForumTopicsByIDRequest for topic_id=%s", SOURCE_TOPIC_ID)
-        resp = await client(functions.channels.GetForumTopicsByIDRequest(
-            channel=source_input,
-            topics_ids=[SOURCE_TOPIC_ID]
-        ))
-        # resp structure: may include .topics list with objects containing top_message or top_message_id
+        logger.info("Attempting messages.GetForumTopicsByIDRequest for topic=%s", source_topic_id)
+        resp = await client(functions.messages.GetForumTopicsByIDRequest(peer=source_input, topics=[source_topic_id]))
         topics = getattr(resp, "topics", None)
         if topics:
-            logger.debug("GetForumTopicsByIDResponse topics: %s", topics)
-            # try to extract top_message or top_message_id
             t = topics[0]
-            top_msg_id = getattr(t, "top_message", None) or getattr(t, "top_message_id", None) or getattr(t, "top_message_id", None)
-            if top_msg_id:
-                logger.info("Topic metadata provided top_message id: %s", top_msg_id)
-                # fetch that message (latest/anchor)
-                msgs = await client.get_messages(source_entity, ids=[top_msg_id])
-                if msgs and len(msgs) > 0:
-                    candidate_msg = msgs[0]
-    except TypeError as e:
-        logger.warning("GetForumTopicsByIDRequest signature unsupported in this Telethon version: %s", e)
+            top_msg = getattr(t, "top_message", None) or getattr(t, "top_message_id", None)
+            logger.debug("messages.GetForumTopicsByIDRequest -> top_message=%s", top_msg)
+            if top_msg:
+                msgs = await client.get_messages(source_entity, ids=[top_msg])
+                if msgs:
+                    return msgs[0]
     except Exception as e:
-        logger.warning("GetForumTopicsByIDRequest failed or returned no usable top_message: %s", e)
+        logger.debug("messages.GetForumTopicsByIDRequest unavailable/failed: %s", e)
 
-    # 2) Fallback: iterate messages from newest to oldest and find one that 'belongs' to the topic
-    if candidate_msg is None:
-        logger.warning("Falling back to iter_messages and attribute-based detection for topic=%s", SOURCE_TOPIC_ID)
-        found = None
-        checked = 0
-        async for msg in client.iter_messages(source_entity, limit=SEARCH_ITER_LIMIT):
-            checked += 1
-            # Several Telethon builds represent topic-membership in different attributes.
-            # Check a variety of attribute names to be robust.
+    # # 2) Try listing topics via messages.GetForumTopicsRequest (Telethon 1.42+)
+    # try:
+    #     logger.info("Attempting functions.messages.GetForumTopicsRequest (list topics)")
+    #     resp = await client(functions.messages.GetForumTopicsRequest(
+    #         peer=source_input, offset_date=0, offset_id=0, offset_topic=0, limit=200
+    #     ))
+    #     topics = getattr(resp, "topics", None)
+    #     if topics:
+    #         for t in topics:
+    #             t_id = getattr(t, "id", None) or getattr(t, "topic_id", None)
+    #             if t_id == source_topic_id:
+    #                 top_msg = getattr(t, "top_message", None) or getattr(t, "top_message_id", None)
+    #                 logger.debug("messages.GetForumTopicsRequest matched topic %s -> top_message=%s", t_id, top_msg)
+    #                 if top_msg:
+    #                     msgs = await client.get_messages(source_entity, ids=[top_msg])
+    #                     if msgs:
+    #                         return msgs[0]
+    # except Exception as e:
+    #     logger.debug("messages.GetForumTopicsRequest unavailable/failed: %s", e)
+
+    # # 3) Fallback to channels.* (Telethon 1.41)
+    # try:
+    #     logger.info("Attempting channels.GetForumTopicsRequest (fallback)")
+    #     resp = await client(functions.channels.GetForumTopicsRequest(
+    #         channel=source_input, offset_date=0, offset_id=0, offset_topic=0, limit=1000
+    #     ))
+    #     topics = getattr(resp, "topics", None)
+    #     if topics:
+    #         for t in topics:
+    #             t_id = getattr(t, "id", None) or getattr(t, "topic_id", None)
+    #             if t_id == source_topic_id:
+    #                 top_msg = getattr(t, "top_message", None) or getattr(t, "top_message_id", None)
+    #                 logger.debug("channels.GetForumTopicsRequest matched topic %s -> top_message=%s", t_id, top_msg)
+    #                 if top_msg:
+    #                     msgs = await client.get_messages(source_entity, ids=[top_msg])
+    #                     if msgs:
+    #                         return msgs[0]
+    # except Exception as e:
+    #     logger.debug("channels.GetForumTopicsRequest failed/absent: %s", e)
+
+    # 4) Last resort: iter_messages scan with extended heuristics
+    logger.warning("Falling back to iter_messages scanning for messages belonging to topic %s (limit=%s)", source_topic_id, search_limit)
+    checked = 0
+    async for msg in client.iter_messages(source_entity, limit=search_limit):
+        checked += 1
+        if checked % 250 == 0:
+            logger.info("iter_messages: checked %s messages so far...", checked)
+
+        # Gather candidate attribute values in many shapes
+        candidates = []
+
+        for attr_name in ("reply_to_top_id", "reply_to_msg_id", "topic_id", "thread_id", "forum_topic_id"):
+            candidates.append(getattr(msg, attr_name, None))
+
+        forum_topic = getattr(msg, "forum_topic", None)
+        if forum_topic is not None:
+            if hasattr(forum_topic, "id"):
+                candidates.append(getattr(forum_topic, "id", None))
+            if hasattr(forum_topic, "top_message"):
+                candidates.append(getattr(forum_topic, "top_message", None))
             try:
-                # Direct attributes known/seen in various runs
-                att_candidates = [
-                    getattr(msg, "forum_topic", None),
-                    getattr(msg, "reply_to_top_id", None),
-                    getattr(msg, "topic_id", None),
-                    getattr(msg, "thread_id", None),
-                    getattr(msg, "forum_topic_id", None),
-                ]
+                if isinstance(forum_topic, dict):
+                    candidates.append(forum_topic.get("id"))
+                    candidates.append(forum_topic.get("top_message"))
             except Exception:
-                att_candidates = [None]
+                pass
 
-            matched = False
-            for att in att_candidates:
-                if att is None:
-                    continue
-                # att could be an object or int
-                try:
-                    att_val = int(att)
-                except Exception:
-                    # Maybe attribute contains object with .id or .top_id
-                    att_val = None
-                    if hasattr(att, "id"):
-                        try:
-                            att_val = int(getattr(att, "id"))
-                        except Exception:
-                            att_val = None
-                    elif hasattr(att, "top_message"):
-                        try:
-                            att_val = int(getattr(att, "top_message"))
-                        except Exception:
-                            att_val = None
-                if att_val == SOURCE_TOPIC_ID:
-                    matched = True
-                    break
-
-            if matched:
-                found = msg
-                logger.info("Found a message matching topic=%s id=%s (checked=%s)", SOURCE_TOPIC_ID, getattr(msg, "id", None), checked)
-                break
-
-        if found:
-            candidate_msg = found
-        else:
-            logger.error("No messages found in source topic %s (source=%s) after checking %s messages",
-                         SOURCE_TOPIC_ID, SOURCE_LINK, checked)
-            await client.disconnect()
-            return
-
-    # candidate_msg should now be a telethon Message to forward
-    if candidate_msg is None:
-        logger.error("No candidate message to forward/reply to placeholder.")
-        await client.disconnect()
-        return
-
-    # Forward as reply to the placeholder message
-    try:
-        logger.info("Forwarding message id=%s from source to target as reply to placeholder id=%s",
-                    candidate_msg.id, placeholder_msg_id)
-        # high-level forward_messages supports reply_to parameter
-        await client.forward_messages(
-            entity=target_entity,
-            messages=candidate_msg.id,
-            from_peer=source_entity,
-            reply_to=placeholder_msg_id
-        )
-        logger.info("Forward succeeded (high-level API).")
-    except TypeError as e:
-        # signature mismatch for reply_to param - fallback to low-level call
-        logger.warning("High-level forward_messages signature not usable: %s", e)
+        # Try msg.to_dict() keys (safe guarded)
         try:
+            md = msg.to_dict()
+            for k in ("reply_to_top_id", "topic_id", "thread_id", "forum_topic", "forum_topic_id"):
+                if k in md:
+                    candidates.append(md.get(k))
+            ft = md.get("forum_topic")
+            if isinstance(ft, dict):
+                candidates.append(ft.get("id"))
+                candidates.append(ft.get("top_message"))
+        except Exception:
+            pass
+
+        # Extract numbers from message text as a last-ditch heuristic
+        try:
+            st = getattr(msg, "message", "")
+            if st:
+                import re
+                found = re.findall(r"\b(\d{2,6})\b", st)
+                for f in found:
+                    try:
+                        candidates.append(int(f))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Normalize and test
+        for att in candidates:
+            if att is None:
+                continue
+            # Unwrap iterables
+            try:
+                if isinstance(att, (list, tuple, set)):
+                    iter_values = list(att)
+                else:
+                    iter_values = [att]
+            except Exception:
+                iter_values = [att]
+
+            for val in iter_values:
+                try:
+                    if isinstance(val, int) and val == source_topic_id:
+                        logger.info("iter_messages: matched int attribute on message id=%s (checked=%s): %s", getattr(msg, "id", None), checked, val)
+                        return msg
+                    if isinstance(val, str) and val.isdigit() and int(val) == source_topic_id:
+                        logger.info("iter_messages: matched numeric-string attribute on message id=%s (checked=%s): %s", getattr(msg, "id", None), checked, val)
+                        return msg
+                except Exception:
+                    pass
+                try:
+                    if hasattr(val, "id") and getattr(val, "id") == source_topic_id:
+                        logger.info("iter_messages: matched nested.id on message id=%s (checked=%s)", getattr(msg, "id", None), checked)
+                        return msg
+                    if hasattr(val, "top_message") and getattr(val, "top_message") == source_topic_id:
+                        logger.info("iter_messages: matched nested.top_message on message id=%s (checked=%s)", getattr(msg, "id", None), checked)
+                        return msg
+                except Exception:
+                    pass
+
+    logger.error("iter_messages scan completed (%s messages checked) without finding a matching message for topic %s", checked, source_topic_id)
+    return None
+
+
+async def forward_candidate(
+    client: TelegramClient,
+    source_entity,
+    source_input,
+    target_entity,
+    target_input,
+    candidate_msg: types.Message,
+    placeholder_msg_id: int,
+    placeholder_top_msg_id: Optional[int] = None
+) -> bool:
+    """
+    Forward candidate_msg so it appears inside the target topic thread.
+    Strategy (preferred -> fallback):
+      A) low-level ForwardMessagesRequest with reply_to=InputReplyToMessage(reply_to_msg_id=0, top_msg_id=...)
+         (this places the forwarded message into the topic anchor)
+      B) low-level ForwardMessagesRequest with reply_to=InputReplyToMessage(reply_to_msg_id=placeholder_msg_id)
+      C) CopyMessagesRequest + small reply to placeholder (best-effort)
+      D) Quoted-text fallback
+    Note: we still call high-level client.forward_messages once earlier (best-effort), but prefer low-level with top_msg_id.
+    """
+    logger.info("Forwarding candidate id=%s (source) to target; reply_to placeholder id=%s top_msg=%s",
+                candidate_msg.id, placeholder_msg_id, placeholder_top_msg_id)
+
+    # Try high-level forward first (no explicit reply) - often works but doesn't guarantee topic placement
+    try:
+        await client.forward_messages(entity=target_entity, messages=candidate_msg.id, from_peer=source_entity)
+        logger.info("High-level client.forward_messages succeeded (no explicit reply).")
+    except Exception as e_high:
+        logger.debug("High-level forward_messages failed/unsupported: %s", e_high)
+
+    # Preferred: low-level ForwardMessagesRequest with top_msg_id (anchor). Use reply_to_msg_id=0 + top_msg_id.
+    if placeholder_top_msg_id is not None:
+        try:
+            logger.info("Attempting low-level ForwardMessagesRequest with top_msg_id=%s", placeholder_top_msg_id)
             resp = await client(functions.messages.ForwardMessagesRequest(
                 from_peer=source_input,
                 id=[candidate_msg.id],
                 to_peer=target_input,
-                # reply_to_msg_id expects int
-                reply_to_msg_id=placeholder_msg_id
+                random_id=[helpers.generate_random_long()],
+                reply_to=types.InputReplyToMessage(reply_to_msg_id=0, top_msg_id=placeholder_top_msg_id)
             ))
-            logger.info("Low-level ForwardMessagesRequest returned: %s", resp)
-        except Exception as e2:
-            logger.exception("Low-level ForwardMessagesRequest failed: %s", e2)
+            async def verify_and_fallback_after_forward(client, target_ent, target_input, placeholder_msg_id, placeholder_top_msg_id, forward_resp, candidate_msg):
+                """
+                Verifies forwarded message placement and attempts fallbacks.
+                - target_ent: resolved entity (high-level) for get_messages
+                - target_input: InputPeer version for low-level calls
+                - placeholder_msg_id: int (message id of placeholder in target)
+                - placeholder_top_msg_id: int or None (top_message anchor)
+                - forward_resp: response object returned from ForwardMessagesRequest (may be Updates)
+                - candidate_msg: original source message (telethon.types.Message)
+                """
+                logger = logging.getLogger("tgd_reply_latest")
+                new_msg_id = None
+
+                # 1) Try to extract created message id(s) from the forward response
+                try:
+                    # Updates may contain UpdateMessageID which maps old->new id, or UpdateNewChannelMessage containing msg
+                    if forward_resp is None:
+                        logger.debug("No low-level response object available to inspect.")
+                    else:
+                        # attempt common patterns
+                        if hasattr(forward_resp, "updates"):
+                            for u in forward_resp.updates:
+                                # UpdateMessageID maps msg_id -> new_id
+                                if isinstance(u, types.UpdateMessageID):
+                                    # UpdateMessageID has 'id' and 'random_id' or 'message' depending; try available attrs
+                                    # Note: Telethon's UpdateMessageID fields vary; prefer UpdateNewChannelMessage below
+                                    try:
+                                        new_msg_id = getattr(u, "id", None)
+                                    except:
+                                        pass
+                                if isinstance(u, types.UpdateNewChannelMessage) or isinstance(u, types.UpdateNewChannelMessage):
+                                    # update contains 'message' attribute
+                                    msg = getattr(u, "message", None)
+                                    if msg:
+                                        new_msg_id = getattr(msg, "id", None)
+                        # Some ForwardMessagesRequest return telethon.tl.types.Updates with UpdateNewMessage objects
+                        # If still None, leave it and attempt to fetch recent messages instead.
+                except Exception as e:
+                    logger.debug("Failed to parse forward_resp for new id: %s", e)
+
+                # 2) If we didn't obtain a new_msg_id, attempt to get the most recent messages and identify candidate by text / timestamp
+                if new_msg_id is None:
+                    try:
+                        # fetch last N messages to find a likely match
+                        recent = await client.get_messages(target_ent, limit=10)
+                        # Heuristic: find a message with same text or from same original author preview and nearly same timestamp
+                        for m in recent:
+                            # compare textual content to candidate or check reply_to etc
+                            if candidate_msg.message and m.message and candidate_msg.message.strip() == m.message.strip():
+                                new_msg_id = m.id
+                                logger.info("Heuristic matched forwarded message as id=%s (by identical text).", new_msg_id)
+                                break
+                    except Exception as e:
+                        logger.debug("Failed to heuristic-match recent messages: %s", e)
+
+                # 3) If we have a new_msg_id, query message and inspect fields
+                inspected = None
+                if new_msg_id is not None:
+                    try:
+                        inspected = await client.get_messages(target_ent, ids=new_msg_id)
+                        logger.info("Inspected forwarded message id=%s: to_dict keys: %s", new_msg_id, list(inspected.to_dict().keys()))
+                        logger.info("Message raw dict: %s", inspected.to_dict())
+                        # Fields of interest to log explicitly (names vary between versions)
+                        # topic_id/thread_id, reply_to_msg_id, reply_to_top_id, peer_id
+                        logger.info("Fields -> id=%s topic_id=%s reply_to_msg_id=%s reply_to_top_id=%s",
+                                    inspected.id,
+                                    getattr(inspected, "topic_id", None),
+                                    getattr(inspected, "reply_to_msg_id", None),
+                                    getattr(inspected, "reply_to_top_id", None))
+                        # If topic_id or reply_to_top_id present and equals placeholder_top_msg_id -> success
+                        topic_ok = (getattr(inspected, "topic_id", None) is not None) or (getattr(inspected, "reply_to_top_id", None) == placeholder_top_msg_id) or (getattr(inspected, "reply_to_msg_id", None) == placeholder_msg_id)
+                        if topic_ok:
+                            logger.info("Forward landed in topic/thread as expected.")
+                            return True
+                        else:
+                            logger.warning("Forward did NOT land in topic/thread (fields show no topic).")
+                    except Exception as e:
+                        logger.debug("Failed to inspect new message: %s", e)
+
+                # 4) Fallback A: try CopyMessagesRequest with reply_to top_msg_id (preserve media)
+                try:
+                    if placeholder_top_msg_id is not None:
+                        logger.info("Attempting CopyMessagesRequest fallback with top_msg_id=%s", placeholder_top_msg_id)
+                        copy_resp = await client(functions.messages.CopyMessagesRequest(
+                            from_peer=source_input,    # NOTE: must be available in scope; else pass as param
+                            id=[candidate_msg.id],
+                            to_peer=target_input,
+                            random_id=[helpers.generate_random_long()]
+                        ))
+                        # After copying, send a tiny reply anchored to top to force thread placement
+                        await client.send_message(target_ent, "(copied)", reply_to=placeholder_msg_id)
+                        logger.info("CopyMessagesRequest fallback executed.")
+                        return True
+                except Exception as e:
+                    logger.debug("CopyMessagesRequest fallback failed: %s", e)
+
+                # 5) Fallback B: quoted-text reply (worst-case)
+                try:
+                    logger.info("Attempting quoted-text fallback reply to anchor inside topic.")
+                    text = candidate_msg.message or "(forward fallback)"
+                    # limit length
+                    text = text[:800]
+                    await client.send_message(target_ent, "Forward fallback:\n\n" + text, reply_to=placeholder_msg_id)
+                    logger.info("Quoted fallback posted as reply to placeholder_msg_id=%s", placeholder_msg_id)
+                    return True
+                except Exception as e:
+                    logger.debug("Quoted fallback failed: %s", e)
+
+                logger.error("All verification/fallback attempts failed for forwarded candidate.")
+                return False
+            logger.info("Low-level ForwardMessagesRequest succeeded with top_msg_id (type=%s)", type(resp).__name__)
+            return True
+        except Exception as e_top:
+            logger.debug("Forward with top_msg_id failed: %s", e_top)
+
+    # Next: low-level ForwardMessagesRequest with reply_to_msg_id (placeholder)
+    if placeholder_msg_id:
+        try:
+            logger.info("Attempting low-level ForwardMessagesRequest with reply_to_msg_id=%s", placeholder_msg_id)
+            resp = await client(functions.messages.ForwardMessagesRequest(
+                from_peer=source_input,
+                id=[candidate_msg.id],
+                to_peer=target_input,
+                random_id=[helpers.generate_random_long()],
+                reply_to=types.InputReplyToMessage(reply_to_msg_id=placeholder_msg_id)
+            ))
+            logger.info("Low-level ForwardMessagesRequest succeeded with reply_to_msg_id (type=%s)", type(resp).__name__)
+            return True
+        except Exception as e_low:
+            logger.debug("Forward with reply_to_msg_id failed: %s", e_low)
+
+    # CopyMessagesRequest fallback (preserves media). Then post a small reply to anchor it.
+    try:
+        logger.info("Attempting CopyMessagesRequest + small reply fallback")
+        copy_resp = await client(functions.messages.CopyMessagesRequest(
+            from_peer=source_input,
+            id=[candidate_msg.id],
+            to_peer=target_input,
+            random_id=[helpers.generate_random_long()]
+        ))
+        if placeholder_msg_id:
+            await client.send_message(target_entity, "(copied)", reply_to=placeholder_msg_id)
+        logger.info("CopyMessagesRequest fallback succeeded.")
+        return True
+    except Exception as e_copy:
+        logger.debug("CopyMessagesRequest failed or unavailable: %s", e_copy)
+
+    # Final quoted-text fallback
+    try:
+        if candidate_msg.message:
+            quote = f"Forward (fallback):\n\n{candidate_msg.message[:800]}"
+            await client.send_message(target_entity, quote, reply_to=placeholder_msg_id)
+            logger.info("Fallback quoted reply posted.")
+            return True
+    except Exception as e_q:
+        logger.debug("Fallback quoted reply failed: %s", e_q)
+
+    logger.error("All forward/reply attempts failed for candidate id=%s", candidate_msg.id)
+    return False
+
+
+async def main():
+    logger.info("Starting tgd_reply_latest at %s", _now_iso())
+
+    if not PLACEHOLDER_META.exists():
+        logger.error("Placeholder metadata file '%s' not found. Run tgd_placeholder.py first.", PLACEHOLDER_META)
+        return
+
+    meta = json.loads(PLACEHOLDER_META.read_text(encoding="utf-8"))
+    placeholder_msg_id = meta.get("target_message_id")
+    target_peer = meta.get("target_peer") or meta.get("target_channel_id")
+    placeholder_top_msg = meta.get("topic_top_message")  # anchor top_message id for placing into topic
+    requested_topic = meta.get("requested_topic", None)
+
+    if not (placeholder_msg_id and target_peer):
+        logger.error("Placeholder metadata incomplete: %s", meta)
+        return
+
+    if not SOURCE_GROUPS:
+        logger.error("tgd_config.SOURCE_GROUPS is empty or unset.")
+        return
+
+    source_link = SOURCE_GROUPS[0]
+
+    # determine source topic id: config overrides placeholder.requested_topic
+    source_topic_id = getattr(cfg, "SOURCE_TOPIC_ID", None) or requested_topic
+    if source_topic_id is None:
+        logger.error("No source topic id available. Set cfg.SOURCE_TOPIC_ID or ensure tgd_placeholder.json contains requested_topic.")
+        return
+
+    client = TelegramClient(SESSION, API_ID, API_HASH)
+    await client.start()
+    logger.info("Client started")
+
+    try:
+        source_entity, source_input = await resolve_entity(client, source_link)
+        target_entity, target_input = await resolve_entity(client, target_peer)
+        logger.info("Resolved source=%s target=%s", getattr(source_entity, "id", source_entity), getattr(target_entity, "id", target_entity))
     except Exception as e:
-        logger.exception("Forward failed: %s", e)
+        logger.exception("Failed to resolve entities: %s", e)
+        await client.disconnect()
+        return
+
+    candidate = await find_candidate_message(client, source_entity, source_input, source_topic_id)
+    if candidate is None:
+        logger.error("Could not find any candidate message in source topic %s", source_topic_id)
+        await client.disconnect()
+        return
+
+    logger.info("Candidate message selected id=%s date=%s", getattr(candidate, "id", None), getattr(candidate, "date", None))
+# ensure placeholder_top_msg (top_message anchor) is known
+    if not placeholder_top_msg and requested_topic:
+        try:
+            logger.info("placeholder_top_msg missing — resolving top_message for requested_topic=%s via GetForumTopicsByIDRequest", requested_topic)
+            resp = await client(functions.messages.GetForumTopicsByIDRequest(peer=target_input, topics=[requested_topic]))
+            topics = getattr(resp, "topics", None)
+            if topics and len(topics) > 0:
+                t = topics[0]
+                placeholder_top_msg = getattr(t, "top_message", None) or getattr(t, "top_message_id", None)
+                logger.info("resolved top_message=%s for requested_topic=%s", placeholder_top_msg, requested_topic)
+            else:
+                # try listing topics as fallback
+                resp2 = await client(functions.messages.GetForumTopicsRequest(peer=target_input, offset_date=0, offset_id=0, offset_topic=0, limit=200))
+                for t in getattr(resp2, "topics", []) or []:
+                    tid = getattr(t, "id", None) or getattr(t, "topic_id", None)
+                    if tid == requested_topic:
+                        placeholder_top_msg = getattr(t, "top_message", None) or getattr(t, "top_message_id", None)
+                        logger.info("resolved top_message via GetForumTopicsRequest -> %s", placeholder_top_msg)
+                        break
+        except Exception as e:
+            logger.warning("Failed to resolve top_message at runtime: %s", e)
+
+    # pass requested_topic (UI/topic id) / placeholder_top_msg to forward_candidate so it tries top_msg_id first
+    ok = await forward_candidate(
+        client,
+        source_entity,
+        source_input,
+        target_entity,
+        target_input,
+        candidate,
+        placeholder_msg_id,
+        placeholder_top_msg  # top_message anchor from tgd_placeholder.json
+    )
+    if not ok:
+        logger.error("Forward/reply process failed for candidate id=%s", candidate.id)
+    else:
+        logger.info("Forward/reply completed for candidate id=%s", candidate.id)
 
     await client.disconnect()
     logger.info("Client disconnected — done.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
-
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.warning("Interrupted by user")

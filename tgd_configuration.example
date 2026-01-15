@@ -1,13 +1,15 @@
 [telegram]
-api_id = 31509523
-api_hash = 1b707ed6c67aafb8cc1bf09b0120fa85
-session = user_session 
+api_id = 12345
+api_hash = hash
+session = user_session
 
 [groups]
-target_group = https://t.me/+cwIP8Wa29w9mN2Iy 
- 
+target_group = https://t.me/123
 
-source_groups =  https://t.me/+rWVr06OGHk4xNmIy
+source_groups =
+    https://t.me/123
+    https://t.me/123
+
 [forwarding]
 forward_batch_size = 50
 concurrency = 1
@@ -21,8 +23,8 @@ enabled = true
 
 [state]
 checkpoint_dir = checkpoints
-snapshot_interval_messages = 5000
+snapshot_interval_messages = 2000
 
 [logging]
 log_dir = logs
-log_level = DEBUG
+log_level = INFO
