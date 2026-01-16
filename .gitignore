@@ -10,6 +10,9 @@
 *.userosscache
 *.sln.docstates
 *.env
+*.conf
+*.session
+*.workspace
 
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs
@@ -33,6 +36,7 @@ bld/
 [Oo]ut/
 [Ll]og/
 [Ll]ogs/
+[Vv]env/
 
 # Build results on 'Bin' directories
 **/[Bb]in/*
